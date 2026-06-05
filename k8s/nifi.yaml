@@ -1,0 +1,338 @@
+# =============================================================================
+# Apache NiFi 2.9.0 — Déploiement Kubernetes single-node
+# =============================================================================
+# Composants déployés :
+#   - Namespace `nifi`
+#   - Secret `nifi-credentials` : single-user creds + sensitive props key
+#   - StatefulSet `nifi` (replicas=1) avec 6 PVCs (conf, state, database,
+#     flowfile, content, provenance)
+#   - Service `nifi` ClusterIP sur 8443 (HTTPS)
+#   - Ingress (TLS terminé NiFi → l'Ingress doit faire passthrough HTTPS,
+#     ou désactiver et utiliser un port-forward)
+#
+# Image utilisée : apache/nifi:2.9.0 (release du 2026-05-01, NiFi 2.x => Java 21)
+#
+# Particularités importantes :
+#   - NiFi 2.x est HTTPS-only sur 8443 avec single-user auth (mot de passe ≥ 12 char)
+#   - NIFI_SENSITIVE_PROPS_KEY doit persister entre redémarrages
+#   - NIFI_WEB_PROXY_HOST doit être renseigné quand on est derrière un Ingress
+#     (sinon NiFi renvoie HTTP 400 "Invalid request")
+#
+# Appliquer :
+#   kubectl apply -f k8s/nifi.yaml
+#
+# Accès :
+#   kubectl -n nifi port-forward svc/nifi 8443:8443
+#   open https://localhost:8443/nifi/
+#   user: admin / pass: ChangeMeNotForProd-12+
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nifi
+  labels:
+    app.kubernetes.io/part-of: nifi
+---
+# -----------------------------------------------------------------------------
+# Secret : single-user auth + clé de chiffrement des props sensibles
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nifi-credentials
+  namespace: nifi
+type: Opaque
+stringData:
+  # ≥ 4 chars
+  SINGLE_USER_CREDENTIALS_USERNAME: admin
+  # ≥ 12 chars OBLIGATOIRE
+  SINGLE_USER_CREDENTIALS_PASSWORD: "ChangeMeNotForProd-12+"
+  # ≥ 12 chars, stable entre redémarrages (sinon flow.json.gz illisible)
+  NIFI_SENSITIVE_PROPS_KEY: "a-32-plus-char-random-key-for-aes"
+---
+# -----------------------------------------------------------------------------
+# Service ClusterIP — exposé sur 8443 HTTPS
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi
+  namespace: nifi
+  labels:
+    app.kubernetes.io/name: nifi
+spec:
+  type: ClusterIP
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+  selector:
+    app.kubernetes.io/name: nifi
+---
+# -----------------------------------------------------------------------------
+# Service headless — nécessaire pour le StatefulSet
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi-headless
+  namespace: nifi
+  labels:
+    app.kubernetes.io/name: nifi
+spec:
+  clusterIP: None
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+  selector:
+    app.kubernetes.io/name: nifi
+---
+# -----------------------------------------------------------------------------
+# StatefulSet NiFi
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nifi
+  namespace: nifi
+  labels:
+    app.kubernetes.io/name: nifi
+spec:
+  serviceName: nifi-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nifi
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nifi
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: nifi
+          image: apache/nifi:2.9.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: https
+              containerPort: 8443
+          envFrom:
+            - secretRef:
+                name: nifi-credentials
+          env:
+            - name: NIFI_WEB_HTTPS_PORT
+              value: "8443"
+            # Renseigner ici l'hôte externe utilisé pour accéder à NiFi
+            # Sinon NiFi renvoie 400 "An invalid request was attempted"
+            - name: NIFI_WEB_PROXY_HOST
+              value: "nifi.local:8443,localhost:8443"
+            - name: NIFI_JVM_HEAP_INIT
+              value: "2g"
+            - name: NIFI_JVM_HEAP_MAX
+              value: "4g"
+            # Limite désactivée pour single-node ; activer pour cluster
+            - name: NIFI_CLUSTER_IS_NODE
+              value: "false"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "5Gi"
+            limits:
+              cpu: "4"
+              memory: "6Gi"
+          # Démarrage long : 60-120s. On laisse une grosse fenêtre au startup.
+          startupProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30   # = 5 min max
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 180
+            periodSeconds: 30
+          volumeMounts:
+            - name: conf
+              mountPath: /opt/nifi/nifi-current/conf
+            - name: state
+              mountPath: /opt/nifi/nifi-current/state
+            - name: database
+              mountPath: /opt/nifi/nifi-current/database_repository
+            - name: flowfile
+              mountPath: /opt/nifi/nifi-current/flowfile_repository
+            - name: content
+              mountPath: /opt/nifi/nifi-current/content_repository
+            - name: provenance
+              mountPath: /opt/nifi/nifi-current/provenance_repository
+  volumeClaimTemplates:
+    - metadata:
+        name: conf
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+    - metadata:
+        name: database
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+    - metadata:
+        name: flowfile
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+    - metadata:
+        name: content
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+    - metadata:
+        name: provenance
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# -----------------------------------------------------------------------------
+# Ingress optionnel — nécessite TLS passthrough (NiFi gère son propre certif).
+# Si votre Ingress controller ne fait pas le passthrough, commentez ce bloc
+# et utilisez `kubectl port-forward svc/nifi 8443:8443`.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nifi
+  namespace: nifi
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: nifi.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nifi
+                port:
+                  number: 8443
+---
+# -----------------------------------------------------------------------------
+# (Optionnel) Kafka pour le use-case end-to-end
+# Un broker single-node KRaft pour tester localement.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: kafka
+spec:
+  type: ClusterIP
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: 9092
+  selector:
+    app.kubernetes.io/name: kafka
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: kafka
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: controller
+              containerPort: 9093
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka.kafka.svc:9092"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@kafka-0.kafka.kafka.svc:9093"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: CLUSTER_ID
+              value: "MkU3OEVBNTcwNTJENDM2Qk"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

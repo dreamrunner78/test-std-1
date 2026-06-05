@@ -1,0 +1,424 @@
+# =============================================================================
+# Apicurio Registry 3.2.5 — Déploiement Kubernetes complet
+# =============================================================================
+# Composants déployés :
+#   - Namespace `apicurio`
+#   - Secret `apicurio-db-credentials`     : credentials Postgres
+#   - ConfigMap `apicurio-config`           : conf backend (CORS, log, auth)
+#   - StatefulSet `apicurio-postgres`       : backing store PostgreSQL 16
+#   - Service `apicurio-postgres`           : ClusterIP 5432
+#   - Deployment `apicurio-registry`        : backend Quarkus (REST + ccompat)
+#   - Service `apicurio-registry`           : ClusterIP 8080 (API) + 9000 (mgmt)
+#   - Deployment `apicurio-registry-ui`     : SPA React
+#   - Service `apicurio-registry-ui`        : ClusterIP 8080
+#   - Ingress `apicurio`                    : expose API + UI via nginx
+#
+# Pré-requis :
+#   - Cluster K8s 1.27+ avec une StorageClass par défaut
+#   - Ingress controller NGINX installé (sinon adapter / supprimer l'Ingress)
+#
+# Appliquer :
+#   kubectl apply -f k8s/apicurio.yaml
+#
+# Vérifier :
+#   kubectl -n apicurio get pods,svc,ingress
+#   kubectl -n apicurio logs deploy/apicurio-registry
+#   curl http://apicurio.local/apis/registry/v3/system/info
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apicurio
+  labels:
+    app.kubernetes.io/part-of: apicurio-registry
+---
+# -----------------------------------------------------------------------------
+# Secret : credentials PostgreSQL
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: apicurio-db-credentials
+  namespace: apicurio
+type: Opaque
+stringData:
+  POSTGRES_DB:        apicurio
+  POSTGRES_USER:      apicurio
+  POSTGRES_PASSWORD:  ChangeMe-NotForProd-32+chars
+---
+# -----------------------------------------------------------------------------
+# ConfigMap : configuration du backend Apicurio (toggles fréquents)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apicurio-config
+  namespace: apicurio
+data:
+  # Log
+  QUARKUS_LOG_LEVEL:               INFO
+  QUARKUS_LOG_CONSOLE_JSON:        "true"
+  # CORS — autorise l'UI à appeler le backend depuis le navigateur
+  QUARKUS_HTTP_CORS:               "true"
+  QUARKUS_HTTP_CORS_ORIGINS:       "http://apicurio.local,https://apicurio.local"
+  QUARKUS_HTTP_CORS_METHODS:       "GET,POST,PUT,DELETE,OPTIONS"
+  QUARKUS_HTTP_CORS_HEADERS:       "*"
+  # Suppressions activées (utile en dev/test ; à durcir en prod)
+  APICURIO_REST_DELETION_ARTIFACT_ENABLED: "true"
+  APICURIO_REST_DELETION_VERSION_ENABLED:  "true"
+  APICURIO_REST_DELETION_GROUP_ENABLED:    "true"
+  # Lecture anonyme désactivée tant qu'OIDC est off — sans effet
+  APICURIO_AUTH_ANONYMOUS_READ_ACCESS_ENABLED: "false"
+---
+# -----------------------------------------------------------------------------
+# Backing store : PostgreSQL 16 (StatefulSet + Service headless)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: apicurio-postgres
+  namespace: apicurio
+  labels:
+    app.kubernetes.io/name: apicurio-postgres
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+  selector:
+    app.kubernetes.io/name: apicurio-postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: apicurio-postgres
+  namespace: apicurio
+  labels:
+    app.kubernetes.io/name: apicurio-postgres
+spec:
+  serviceName: apicurio-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apicurio-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: apicurio-postgres
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: apicurio-db-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "apicurio", "-d", "apicurio"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "apicurio", "-d", "apicurio"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+# -----------------------------------------------------------------------------
+# Backend Apicurio Registry (Quarkus app — REST v3 + ccompat v7)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: apicurio-registry
+  namespace: apicurio
+  labels:
+    app.kubernetes.io/name: apicurio-registry
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: management
+      port: 9000
+      targetPort: 9000
+  selector:
+    app.kubernetes.io/name: apicurio-registry
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apicurio-registry
+  namespace: apicurio
+  labels:
+    app.kubernetes.io/name: apicurio-registry
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apicurio-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: apicurio-registry
+    spec:
+      initContainers:
+        # Attend Postgres prêt avant de démarrer (évite les boucles CrashLoopBackOff)
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z apicurio-postgres 5432; do
+                echo "waiting for postgres..."; sleep 2;
+              done
+      containers:
+        - name: registry
+          image: quay.io/apicurio/apicurio-registry:3.2.5
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 9000
+          env:
+            # Storage : PostgreSQL
+            - name: APICURIO_STORAGE_KIND
+              value: sql
+            - name: APICURIO_STORAGE_SQL_KIND
+              value: postgresql
+            - name: APICURIO_DATASOURCE_URL
+              value: jdbc:postgresql://apicurio-postgres:5432/apicurio
+            - name: APICURIO_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: apicurio-db-credentials
+                  key: POSTGRES_USER
+            - name: APICURIO_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: apicurio-db-credentials
+                  key: POSTGRES_PASSWORD
+            - name: APICURIO_SQL_INIT
+              value: "true"
+            # JVM — heap calé sur les limits du Pod
+            - name: JAVA_MAX_MEM_RATIO
+              value: "50"
+            - name: JAVA_OPTS_APPEND
+              value: "-XX:+UseG1GC -XX:MaxRAMPercentage=75"
+          envFrom:
+            - configMapRef:
+                name: apicurio-config
+          # Probes : depuis 3.2.0 elles sont sur le port 9000 (management)
+          startupProbe:
+            httpGet:
+              path: /q/health/started
+              port: management
+            periodSeconds: 5
+            failureThreshold: 60   # = 5 min max au démarrage
+          readinessProbe:
+            httpGet:
+              path: /q/health/ready
+              port: management
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /q/health/live
+              port: management
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+---
+# -----------------------------------------------------------------------------
+# UI Apicurio Registry (SPA React — image séparée depuis la v3)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: apicurio-registry-ui
+  namespace: apicurio
+  labels:
+    app.kubernetes.io/name: apicurio-registry-ui
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  selector:
+    app.kubernetes.io/name: apicurio-registry-ui
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apicurio-registry-ui
+  namespace: apicurio
+  labels:
+    app.kubernetes.io/name: apicurio-registry-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apicurio-registry-ui
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: apicurio-registry-ui
+    spec:
+      containers:
+        - name: ui
+          image: quay.io/apicurio/apicurio-registry-ui:3.2.5
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # URL que le navigateur utilisera pour appeler l'API.
+            # IMPORTANT : c'est l'URL EXTERNE (visible par le navigateur),
+            # pas le DNS interne du cluster.
+            - name: REGISTRY_API_URL
+              value: http://apicurio.local/apis/registry/v3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+# -----------------------------------------------------------------------------
+# Ingress : un seul host expose UI et API
+#   /          -> UI
+#   /apis      -> backend (REST v3, ccompat v7, cncf, system)
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: apicurio
+  namespace: apicurio
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: apicurio.local
+      http:
+        paths:
+          - path: /apis
+            pathType: Prefix
+            backend:
+              service:
+                name: apicurio-registry
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: apicurio-registry-ui
+                port:
+                  number: 8080
+---
+# -----------------------------------------------------------------------------
+# HorizontalPodAutoscaler — scale backend selon la CPU
+# -----------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: apicurio-registry
+  namespace: apicurio
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: apicurio-registry
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# -----------------------------------------------------------------------------
+# PodDisruptionBudget — au moins 1 backend disponible en permanence
+# -----------------------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apicurio-registry
+  namespace: apicurio
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apicurio-registry
