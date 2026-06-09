@@ -69,21 +69,42 @@ curl -s "$REG/apis/registry/v3/system/uiConfig" | jq
 
 ## 2. Endpoints de management (port 9000)
 
-Depuis **Apicurio 3.2.0**, les endpoints Quarkus de santé et métriques ne sont plus sur 8080 mais sur **9000**. Les probes Kubernetes du manifeste fourni utilisent ce port.
+Depuis **Apicurio 3.2.0**, les endpoints de santé et métriques ne sont plus sur 8080 mais sur **9000** (port management séparé). Les probes Kubernetes du manifeste fourni utilisent ce port.
 
-| Méthode | Chemin           | Usage                                                           |
-| ------- | ---------------- | --------------------------------------------------------------- |
-| GET     | `/q/health`      | Statut agrégé (DB + storage + readiness + liveness)             |
-| GET     | `/q/health/live` | Liveness probe                                                  |
-| GET     | `/q/health/ready`| Readiness probe                                                 |
-| GET     | `/q/health/started`| Startup probe                                                 |
-| GET     | `/q/metrics`     | Métriques Prometheus (HTTP, JVM, datasource, etc.)              |
+> **⚠️ Particularité Apicurio** : contrairement à un Quarkus standard où ces endpoints sont sous `/q/health` et `/q/metrics`, Apicurio les **remappe à la racine** via `quarkus.smallrye-health.root-path=/health` et `quarkus.micrometer.export.prometheus.path=/metrics`. Si vous suivez la doc Quarkus générique, vous obtiendrez systématiquement `<html><body><h1>Resource not found</h1></body></html>`.
+
+| Méthode | Chemin (port 9000) | Usage                                                        |
+| ------- | ------------------- | ------------------------------------------------------------ |
+| GET     | `/health`           | Statut agrégé (DB + storage + readiness + liveness)          |
+| GET     | `/health/live`      | Liveness probe                                               |
+| GET     | `/health/ready`     | Readiness probe                                              |
+| GET     | `/health/started`   | Startup probe                                                |
+| GET     | `/metrics`          | Métriques Prometheus (HTTP, JVM, datasource, etc.)           |
 
 ```bash
-curl -s "$MGMT/q/health" | jq
-curl -s "$MGMT/q/health/ready"
-curl -s "$MGMT/q/metrics" | head -20
+curl -s "$MGMT/health" | jq
+curl -s "$MGMT/health/ready" | jq
+curl -s "$MGMT/health/live" | jq
+curl -s "$MGMT/metrics" | head -20
 ```
+
+Exemple de retour `/health/ready` sur un déploiement Postgres-backed :
+
+```json
+{
+  "status": "UP",
+  "checks": [
+    { "name": "ResponseTimeoutReadinessCheck",    "status": "UP" },
+    { "name": "ImportLifecycleReadinessCheck",    "status": "UP" },
+    { "name": "PersistenceSimpleReadinessCheck",  "status": "UP" },
+    { "name": "Database connections health check","status": "UP",
+      "data": { "postgresql": "UP" } },
+    { "name": "ElasticsearchIndexReadinessCheck", "status": "UP" }
+  ]
+}
+```
+
+> **Note pour la branche 2.x in-memory** : les paths sont les mêmes (`/health/*`, `/metrics`) MAIS exposés sur le **port 8080** — pas de port 9000 séparé avant la v3.2.
 
 ---
 
@@ -155,7 +176,7 @@ curl -s -X POST "$REG/apis/registry/v3/groups/orders/artifacts?ifExists=CREATE_V
     "artifactId": "Order",
     "artifactType": "AVRO",
     "name": "Order",
-    "description": "Schéma Avro d'un ordre client",
+    "description": "Schema Avro pour un ordre client",
     "labels": { "owner": "data-platform" },
     "firstVersion": {
       "version": "1.0.0",

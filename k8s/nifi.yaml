@@ -1,5 +1,5 @@
 # =============================================================================
-# Apache NiFi 2.9.0 — Déploiement Kubernetes single-node
+# Apache NiFi 2.8.0 — Déploiement Kubernetes single-node
 # =============================================================================
 # Composants déployés :
 #   - Namespace `nifi`
@@ -10,7 +10,7 @@
 #   - Ingress (TLS terminé NiFi → l'Ingress doit faire passthrough HTTPS,
 #     ou désactiver et utiliser un port-forward)
 #
-# Image utilisée : apache/nifi:2.9.0 (release du 2026-05-01, NiFi 2.x => Java 21)
+# Image utilisée : apache/nifi:2.8.0 (release du 2026-05-01, NiFi 2.x => Java 21)
 #
 # Particularités importantes :
 #   - NiFi 2.x est HTTPS-only sur 8443 avec single-user auth (mot de passe ≥ 12 char)
@@ -27,12 +27,12 @@
 #   user: admin / pass: ChangeMeNotForProd-12+
 # =============================================================================
 ---
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: nifi
-  labels:
-    app.kubernetes.io/part-of: nifi
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: nifi
+#   labels:
+#     app.kubernetes.io/part-of: nifi
 ---
 # -----------------------------------------------------------------------------
 # Secret : single-user auth + clé de chiffrement des props sensibles
@@ -41,13 +41,15 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: nifi-credentials
-  namespace: nifi
+  namespace: apicurio
 type: Opaque
 stringData:
   # ≥ 4 chars
   SINGLE_USER_CREDENTIALS_USERNAME: admin
-  # ≥ 12 chars OBLIGATOIRE
-  SINGLE_USER_CREDENTIALS_PASSWORD: "ChangeMeNotForProd-12+"
+  # ≥ 12 chars OBLIGATOIRE — sinon le script set-single-user-credentials
+  # échoue silencieusement (ERROR: Password must be at least 12 characters)
+  # et users.xml reste vide → aucune authentification possible.
+  SINGLE_USER_CREDENTIALS_PASSWORD: "Samy2016.dcp1"
   # ≥ 12 chars, stable entre redémarrages (sinon flow.json.gz illisible)
   NIFI_SENSITIVE_PROPS_KEY: "a-32-plus-char-random-key-for-aes"
 ---
@@ -58,7 +60,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: nifi
-  namespace: nifi
+  namespace: apicurio
   labels:
     app.kubernetes.io/name: nifi
 spec:
@@ -77,7 +79,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: nifi-headless
-  namespace: nifi
+  namespace: apicurio
   labels:
     app.kubernetes.io/name: nifi
 spec:
@@ -96,7 +98,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: nifi
-  namespace: nifi
+  namespace: apicurio
   labels:
     app.kubernetes.io/name: nifi
 spec:
@@ -110,13 +112,42 @@ spec:
       labels:
         app.kubernetes.io/name: nifi
     spec:
+      # Avec la SCC `anyuid` accordée au ServiceAccount du namespace
+      # (oc adm policy add-scc-to-user anyuid -z default -n apicurio),
+      # on tourne avec le user nifi natif de l'image (uid 1000:1000).
+      # C'est plus simple que rebuilder l'image avec des perms gid=0.
       securityContext:
         fsGroup: 1000
         runAsUser: 1000
         runAsGroup: 1000
+      initContainers:
+        # La PVC `conf` est vide au premier boot et masque les fichiers de
+        # configuration cuits dans l'image (bootstrap.conf, nifi.properties,
+        # logback.xml, etc.). Sans ces fichiers, l'entrypoint NiFi échoue à
+        # `sed` bootstrap.conf et le pod plante en CrashLoopBackOff.
+        # Cet init container monte la PVC sur /persist (pas /conf) pour voir
+        # les fichiers cuits, et les copie vers la PVC à la première exécution.
+        - name: init-conf
+          image: apache/nifi:2.8.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -f /persist/bootstrap.conf ]; then
+                echo "Seeding empty conf PVC from image defaults..."
+                cp -a /opt/nifi/nifi-current/conf/. /persist/
+                echo "Seed done. Files now in PVC:"
+                ls -la /persist/
+              else
+                echo "conf PVC already seeded, skipping."
+              fi
+          volumeMounts:
+            - name: conf
+              mountPath: /persist
       containers:
         - name: nifi
-          image: apache/nifi:2.9.0
+          image: apache/nifi:2.8.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: https
@@ -127,6 +158,12 @@ spec:
           env:
             - name: NIFI_WEB_HTTPS_PORT
               value: "8443"
+            # /!\ Par défaut NiFi bind sur $HOSTNAME (= nifi-0, l'IP du pod) et
+            # PAS sur loopback. Le Service marche, mais `kubectl port-forward`
+            # se connecte à localhost dans le pod et reçoit ECONNREFUSED.
+            # Forcer 0.0.0.0 pour écouter sur toutes les interfaces.
+            - name: NIFI_WEB_HTTPS_HOST
+              value: "0.0.0.0"
             # Renseigner ici l'hôte externe utilisé pour accéder à NiFi
             # Sinon NiFi renvoie 400 "An invalid request was attempted"
             - name: NIFI_WEB_PROXY_HOST
@@ -228,7 +265,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: nifi
-  namespace: nifi
+  namespace: apicurio
   annotations:
     nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
     nginx.ingress.kubernetes.io/ssl-passthrough: "true"
@@ -252,87 +289,87 @@ spec:
 # (Optionnel) Kafka pour le use-case end-to-end
 # Un broker single-node KRaft pour tester localement.
 # -----------------------------------------------------------------------------
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: kafka
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: kafka
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: kafka
-  namespace: kafka
-spec:
-  type: ClusterIP
-  ports:
-    - name: kafka
-      port: 9092
-      targetPort: 9092
-  selector:
-    app.kubernetes.io/name: kafka
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: kafka
+#   namespace: kafka
+# spec:
+#   type: ClusterIP
+#   ports:
+#     - name: kafka
+#       port: 9092
+#       targetPort: 9092
+#   selector:
+#     app.kubernetes.io/name: kafka
 ---
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: kafka
-  namespace: kafka
-spec:
-  serviceName: kafka
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: kafka
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: kafka
-    spec:
-      containers:
-        - name: kafka
-          image: apache/kafka:3.9.0
-          ports:
-            - name: kafka
-              containerPort: 9092
-            - name: controller
-              containerPort: 9093
-          env:
-            - name: KAFKA_NODE_ID
-              value: "1"
-            - name: KAFKA_PROCESS_ROLES
-              value: "broker,controller"
-            - name: KAFKA_LISTENERS
-              value: "PLAINTEXT://:9092,CONTROLLER://:9093"
-            - name: KAFKA_ADVERTISED_LISTENERS
-              value: "PLAINTEXT://kafka.kafka.svc:9092"
-            - name: KAFKA_CONTROLLER_LISTENER_NAMES
-              value: "CONTROLLER"
-            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-              value: "1@kafka-0.kafka.kafka.svc:9093"
-            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-              value: "1"
-            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-              value: "1"
-            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-              value: "1"
-            - name: CLUSTER_ID
-              value: "MkU3OEVBNTcwNTJENDM2Qk"
-          resources:
-            requests:
-              cpu: "200m"
-              memory: "512Mi"
-            limits:
-              cpu: "2"
-              memory: "2Gi"
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/kafka/data
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 10Gi
+# apiVersion: apps/v1
+# kind: StatefulSet
+# metadata:
+#   name: kafka
+#   namespace: kafka
+# spec:
+#   serviceName: kafka
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/name: kafka
+#   template:
+#     metadata:
+#       labels:
+#         app.kubernetes.io/name: kafka
+#     spec:
+#       containers:
+#         - name: kafka
+#           image: apache/kafka:3.9.0
+#           ports:
+#             - name: kafka
+#               containerPort: 9092
+#             - name: controller
+#               containerPort: 9093
+#           env:
+#             - name: KAFKA_NODE_ID
+#               value: "1"
+#             - name: KAFKA_PROCESS_ROLES
+#               value: "broker,controller"
+#             - name: KAFKA_LISTENERS
+#               value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+#             - name: KAFKA_ADVERTISED_LISTENERS
+#               value: "PLAINTEXT://kafka.kafka.svc:9092"
+#             - name: KAFKA_CONTROLLER_LISTENER_NAMES
+#               value: "CONTROLLER"
+#             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+#               value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+#             - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+#               value: "1@kafka-0.kafka.kafka.svc:9093"
+#             - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+#               value: "1"
+#             - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+#               value: "1"
+#             - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+#               value: "1"
+#             - name: CLUSTER_ID
+#               value: "MkU3OEVBNTcwNTJENDM2Qk"
+#           resources:
+#             requests:
+#               cpu: "200m"
+#               memory: "512Mi"
+#             limits:
+#               cpu: "2"
+#               memory: "2Gi"
+#           volumeMounts:
+#             - name: data
+#               mountPath: /var/lib/kafka/data
+#   volumeClaimTemplates:
+#     - metadata:
+#         name: data
+#       spec:
+#         accessModes: ["ReadWriteOnce"]
+#         resources:
+#           requests:
+#             storage: 10Gi

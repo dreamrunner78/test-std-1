@@ -1,0 +1,91 @@
+# =============================================================================
+# Apicurio Tester Pod — pour exécuter les curl du guide depuis le cluster
+# =============================================================================
+#
+# But : disposer d'un pod déjà placé dans le namespace `apicurio-mem`, avec
+# `curl` installé, et la variable d'env `REG` pré-câblée sur le Service interne
+# `apicurio-registry:8080`. On entre dans le pod avec :
+#
+#   kubectl -n apicurio-mem exec -it apicurio-tester -- sh
+#
+# Puis on copie-colle les exemples du guide /docs/APICURIO_API_GUIDE.md.
+#
+# /!\ ATTENTION — le guide documente l'API v3, mais ton cluster tourne
+#     actuellement la 2.6.13 in-memory. Adaptations à faire dans les curl :
+#
+#     /apis/registry/v3   -->  /apis/registry/v2
+#     /apis/ccompat/v7    -->  /apis/ccompat/v6
+#     /q/health/{live,ready}, port 9000  -->  /health/{live,ready}, port 8080
+#
+#     Et certains endpoints v3 n'existent pas en v2 (à sauter) :
+#       - Branches  (POST /groups/{g}/artifacts/{a}/branches)
+#       - Règles de groupe  (POST /groups/{g}/rules)
+#       - Suppression de groupe entière  (DELETE /groups/{g})
+#       - Snapshots  (POST /admin/snapshots, kafkasql only)
+#
+# Choix d'image (commenté en option B) :
+#   A. curlimages/curl:8.10.1  — ~14 MB, juste curl. Tu lis du JSON brut.
+#   B. nicolaka/netshoot       — ~150 MB, curl+jq+dig+nslookup+openssl.
+#                                À choisir si tu veux jq pour suivre le guide
+#                                à la lettre, ou debugger DNS / TLS.
+#
+# Appliquer :
+#   kubectl apply -f k8s/apicurio-tester.yaml
+#
+# Tester rapidement :
+#   kubectl -n apicurio-mem exec apicurio-tester -- \
+#     curl -s http://apicurio-registry:8080/apis/registry/v2/system/info
+#
+# Nettoyer :
+#   kubectl -n apicurio-mem delete pod apicurio-tester
+# =============================================================================
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apicurio-tester
+  namespace: apicurio-mem
+  labels:
+    app.kubernetes.io/name: apicurio-tester
+    app.kubernetes.io/part-of: apicurio-registry
+spec:
+  # Pas de gracetime — debug pod, on veut un kill rapide
+  terminationGracePeriodSeconds: 0
+  restartPolicy: Always
+  containers:
+    - name: tester
+      # ---- Option A (par défaut) : truly lightweight, curl uniquement ----
+      image: curlimages/curl:8.10.1
+      # ---- Option B (alternative) : décommenter ces 2 lignes et commenter
+      # celle au-dessus pour avoir curl + jq + outils réseau ----
+      # image: nicolaka/netshoot:latest
+
+      # L'image curlimages/curl a `curl` comme entrypoint par défaut — on
+      # override pour garder le pod vivant et permettre `kubectl exec`.
+      command: ["sleep", "infinity"]
+
+      env:
+        # URL de l'API Apicurio (résolution DNS in-cluster, même namespace)
+        - name: REG
+          value: http://apicurio-registry:8080
+        # Alias pour les exemples du guide qui utilisent $MGMT
+        # (en v2, tout est sur 8080 — pas de port 9000 séparé)
+        - name: MGMT
+          value: http://apicurio-registry:8080
+
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "200m"
+          memory: "64Mi"
+
+      securityContext:
+        runAsNonRoot: true
+        # Pas de runAsUser fixe : OpenShift assignera un UID via la SCC,
+        # et l'image curlimages/curl tolère n'importe quel UID.
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]

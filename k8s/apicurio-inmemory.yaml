@@ -1,0 +1,194 @@
+# =============================================================================
+# Apicurio Registry — Déploiement Kubernetes en mode IN-MEMORY (sans DB)
+# =============================================================================
+#
+# /!\ IMPORTANT — pourquoi l'image change ici :
+#
+#   Apicurio Registry 3.x a SUPPRIMÉ le mode in-memory. Les seules valeurs
+#   valides de `APICURIO_STORAGE_KIND` en v3 sont : sql, kafkasql, gitops,
+#   kubernetesops. Aucune n'est purement en RAM sans dépendance externe.
+#   Tenter `mem` provoque l'erreur :
+#       IllegalStateException: No Registry storage variant defined for value mem
+#
+#   Le vrai mode "in-memory pur, zéro dépendance" n'existe que sur la
+#   branche 2.x, via une IMAGE DÉDIÉE : apicurio/apicurio-registry-mem
+#   (dernière tag stable au moment de la rédaction : 2.6.13.Final).
+#
+#   Conséquences à connaître par rapport au déploiement v3 :
+#   - Préfixe d'env vars : REGISTRY_* (en v2) au lieu de APICURIO_* (en v3)
+#   - Base API REST       : /apis/registry/v2  (au lieu de /apis/registry/v3)
+#   - Base ccompat        : /apis/ccompat/v6   (au lieu de /apis/ccompat/v7)
+#   - Pas de port 9000 séparé — health et metrics restent sur 8080
+#   - L'UI est INCLUSE dans la même image, accessible sur /ui/
+#     (pas besoin d'un Deployment apicurio-registry-ui séparé)
+#
+# /!\ Limites du mode in-memory (inchangées vs. v3) :
+#   - Toutes les données sont PERDUES à chaque redémarrage du pod
+#   - replicas DOIT rester à 1 (état non partagé entre pods)
+#   - Réservé aux environnements DEV / TEST / DEMO / CI
+#
+# Appliquer :
+#   kubectl apply -f k8s/apicurio-inmemory.yaml
+#
+# Vérifier :
+#   kubectl -n apicurio-mem get pods,svc
+#   kubectl -n apicurio-mem port-forward svc/apicurio-registry 8080:8080
+#   curl http://localhost:8080/apis/registry/v2/system/info
+#   open http://localhost:8080/ui/
+# =============================================================================
+# ---
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: apicurio-mem
+#   labels:
+#     app.kubernetes.io/part-of: apicurio-registry
+#     apicurio.io/storage: in-memory
+# ---
+# -----------------------------------------------------------------------------
+# ConfigMap : toggles fréquents (CORS, log)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apicurio-config
+  namespace: apicurio-mem
+data:
+  # Log
+  QUARKUS_LOG_LEVEL:        INFO
+  QUARKUS_LOG_CONSOLE_JSON: "true"
+  # CORS — autorise l'UI / outils externes à appeler l'API
+  QUARKUS_HTTP_CORS:         "true"
+  QUARKUS_HTTP_CORS_ORIGINS: "http://apicurio.local,https://apicurio.local,http://localhost:8888,http://localhost:8080"
+  QUARKUS_HTTP_CORS_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
+  QUARKUS_HTTP_CORS_HEADERS: "*"
+  # Suppressions activées (en v2 : REGISTRY_* et non APICURIO_*)
+  REGISTRY_REST_ARTIFACT_DELETION_ENABLED: "true"
+  # UI editable (en v2, l'UI est read-only par défaut)
+  REGISTRY_UI_FEATURES_READONLY: "false"
+---
+# -----------------------------------------------------------------------------
+# Service : ClusterIP exposant le port 8080
+# (API + UI + health/metrics — tout sur le même port en v2)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: apicurio-registry
+  namespace: apicurio-mem
+  labels:
+    app.kubernetes.io/name: apicurio-registry
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  selector:
+    app.kubernetes.io/name: apicurio-registry
+---
+# -----------------------------------------------------------------------------
+# Deployment Apicurio Registry — image in-memory dédiée
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apicurio-registry
+  namespace: apicurio-mem
+  labels:
+    app.kubernetes.io/name: apicurio-registry
+spec:
+  # MUST stay at 1 — chaque replica a son propre état in-memory
+  replicas: 1
+  strategy:
+    # Recreate : on ne peut pas rolling-update un singleton sans état partagé
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apicurio-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: apicurio-registry
+    spec:
+      containers:
+        - name: registry
+          # Image in-memory dédiée — la dernière stable de la branche 2.x.
+          # Storage backend = RAM, aucune configuration nécessaire.
+          image: quay.io/apicurio/apicurio-registry-mem:2.6.13.Final
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: apicurio-config
+          # Pas de JAVA_OPTS_APPEND : le launcher de l'image active déjà
+          # ParallelGC + MaxRAMPercentage=50 (container-aware). Ajouter
+          # `-XX:+UseG1GC` causerait "Multiple garbage collectors selected".
+          # En v2, Apicurio remappe smallrye-health vers /health/* (et NON
+          # /q/health/* — le défaut Quarkus) pour rester compatible avec
+          # les déploiements 1.x. C'est défini en interne via
+          # `quarkus.smallrye-health.root-path=/health`.
+          # Le port management 9000 séparé n'arrive qu'en v3.2.0.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000840000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+---
+# -----------------------------------------------------------------------------
+# Ingress optionnel — un seul host expose UI et API
+#   /                                    -> root (redirige vers /ui)
+#   /ui                                  -> UI bundlée
+#   /apis (registry/v2, ccompat/v6, ...) -> API REST
+#
+# Si pas d'ingress controller, supprimer ce bloc et utiliser :
+#   kubectl -n apicurio-mem port-forward svc/apicurio-registry 8080:8080
+# -----------------------------------------------------------------------------
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: apicurio
+#   namespace: apicurio-mem
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+# spec:
+#   ingressClassName: nginx
+#   rules:
+#     - host: apicurio.local
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: apicurio-registry
+#                 port:
+#                   number: 8080

@@ -26,12 +26,12 @@
 #   curl http://apicurio.local/apis/registry/v3/system/info
 # =============================================================================
 ---
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: apicurio
-  labels:
-    app.kubernetes.io/part-of: apicurio-registry
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: apicurio
+#   labels:
+#     app.kubernetes.io/part-of: apicurio-registry
 ---
 # -----------------------------------------------------------------------------
 # Secret : credentials PostgreSQL
@@ -43,9 +43,10 @@ metadata:
   namespace: apicurio
 type: Opaque
 stringData:
-  POSTGRES_DB:        apicurio
-  POSTGRES_USER:      apicurio
-  POSTGRES_PASSWORD:  ChangeMe-NotForProd-32+chars
+  # Convention de l'image SCLO PostgreSQL (compatible OpenShift)
+  POSTGRESQL_DATABASE: apicurio
+  POSTGRESQL_USER:     apicurio
+  POSTGRESQL_PASSWORD: apicurio
 ---
 # -----------------------------------------------------------------------------
 # ConfigMap : configuration du backend Apicurio (toggles fréquents)
@@ -108,20 +109,22 @@ spec:
       labels:
         app.kubernetes.io/name: apicurio-postgres
     spec:
-      securityContext:
-        fsGroup: 999
+      # Pas de fsGroup ici : OpenShift refusera toute valeur hors range
+      # autorisée (annotation openshift.io/sa.scc.supplemental-groups
+      # du namespace). On laisse la SCC l'assigner.
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          # Image SCLO compatible OpenShift — tourne avec n'importe quel UID,
+          # contrairement à postgres:16-alpine qui exige uid 999.
+          # Tag rolling, public, pas de pull secret requis.
+          image: quay.io/sclorg/postgresql-16-c9s:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: postgres
               containerPort: 5432
           envFrom:
             - secretRef:
                 name: apicurio-db-credentials
-          env:
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "apicurio", "-d", "apicurio"]
@@ -140,8 +143,16 @@ spec:
               cpu: "1"
               memory: "1Gi"
           volumeMounts:
+            # SCLO image utilise /var/lib/pgsql/data (et NON
+            # /var/lib/postgresql/data comme l'image officielle)
             - name: data
-              mountPath: /var/lib/postgresql/data
+              mountPath: /var/lib/pgsql/data
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000850000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -227,41 +238,41 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: apicurio-db-credentials
-                  key: POSTGRES_USER
+                  key: POSTGRESQL_USER
             - name: APICURIO_DATASOURCE_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: apicurio-db-credentials
-                  key: POSTGRES_PASSWORD
+                  key: POSTGRESQL_PASSWORD
             - name: APICURIO_SQL_INIT
               value: "true"
-            # JVM — heap calé sur les limits du Pod
-            - name: JAVA_MAX_MEM_RATIO
-              value: "50"
-            - name: JAVA_OPTS_APPEND
-              value: "-XX:+UseG1GC -XX:MaxRAMPercentage=75"
+          # Pas de JAVA_OPTS_APPEND : le launcher de l'image active déjà
+          # ParallelGC + MaxRAMPercentage=50 (container-aware). Ajouter
+          # `-XX:+UseG1GC` causerait "Multiple garbage collectors selected".
           envFrom:
             - configMapRef:
                 name: apicurio-config
-          # Probes : depuis 3.2.0 elles sont sur le port 9000 (management)
-          startupProbe:
-            httpGet:
-              path: /q/health/started
-              port: management
-            periodSeconds: 5
-            failureThreshold: 60   # = 5 min max au démarrage
+          # Probes : depuis v3.2.0 le port 9000 (management) est séparé du
+          # port 8080 (REST). MAIS les paths n'utilisent PAS le préfixe /q/
+          # standard de Quarkus — Apicurio remappe smallrye-health sur
+          # /health/* (override interne via quarkus.smallrye-health.root-path).
+          # Démarre en ~8s : pas besoin de startupProbe.
           readinessProbe:
             httpGet:
-              path: /q/health/ready
+              path: /health/ready
               port: management
+            initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
+            failureThreshold: 6
           livenessProbe:
             httpGet:
-              path: /q/health/live
+              path: /health/live
               port: management
+            initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: "200m"
@@ -271,7 +282,7 @@ spec:
               memory: "1Gi"
           securityContext:
             runAsNonRoot: true
-            runAsUser: 1001
+            runAsUser: 1000850000
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
             capabilities:
@@ -347,7 +358,7 @@ spec:
               memory: "256Mi"
           securityContext:
             runAsNonRoot: true
-            runAsUser: 1001
+            runAsUser: 1000850000
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
@@ -357,68 +368,68 @@ spec:
 #   /          -> UI
 #   /apis      -> backend (REST v3, ccompat v7, cncf, system)
 # -----------------------------------------------------------------------------
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: apicurio
-  namespace: apicurio
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
-spec:
-  ingressClassName: nginx
-  rules:
-    - host: apicurio.local
-      http:
-        paths:
-          - path: /apis
-            pathType: Prefix
-            backend:
-              service:
-                name: apicurio-registry
-                port:
-                  number: 8080
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: apicurio-registry-ui
-                port:
-                  number: 8080
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: apicurio
+#   namespace: apicurio
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+# spec:
+#   ingressClassName: nginx
+#   rules:
+#     - host: apicurio.local
+#       http:
+#         paths:
+#           - path: /apis
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: apicurio-registry
+#                 port:
+#                   number: 8080
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: apicurio-registry-ui
+#                 port:
+#                   number: 8080
 ---
 # -----------------------------------------------------------------------------
 # HorizontalPodAutoscaler — scale backend selon la CPU
 # -----------------------------------------------------------------------------
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: apicurio-registry
-  namespace: apicurio
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: apicurio-registry
-  minReplicas: 2
-  maxReplicas: 6
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: apicurio-registry
+#   namespace: apicurio
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: apicurio-registry
+#   minReplicas: 2
+#   maxReplicas: 6
+#   metrics:
+#     - type: Resource
+#       resource:
+#         name: cpu
+#         target:
+#           type: Utilization
+#           averageUtilization: 70
 ---
 # -----------------------------------------------------------------------------
 # PodDisruptionBudget — au moins 1 backend disponible en permanence
 # -----------------------------------------------------------------------------
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: apicurio-registry
-  namespace: apicurio
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: apicurio-registry
+# apiVersion: policy/v1
+# kind: PodDisruptionBudget
+# metadata:
+#   name: apicurio-registry
+#   namespace: apicurio
+# spec:
+#   minAvailable: 1
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/name: apicurio-registry
