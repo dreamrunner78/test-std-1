@@ -143,16 +143,38 @@ spec:
               cpu: "1"
               memory: "1Gi"
           volumeMounts:
-            # SCLO image utilise /var/lib/pgsql/data (et NON
-            # /var/lib/postgresql/data comme l'image officielle)
+            # /!\ readOnlyRootFilesystem: true → on doit ouvrir TOUTES les
+            # zones où Postgres écrit en runtime.
+            #
+            # - /var/lib/pgsql        : emptyDir (l'image y écrit `passwd`,
+            #                           lock files, etc. en plus de data/)
+            # - /var/lib/pgsql/data   : PVC persistant (sub-mount sous le
+            #                           emptyDir parent — Kubernetes empile
+            #                           les mounts par profondeur)
+            # - /tmp                  : emptyDir (fichiers temporaires Postgres)
+            # - /run/postgresql       : emptyDir (sockets Unix locaux)
+            - name: pgsql-home
+              mountPath: /var/lib/pgsql
             - name: data
               mountPath: /var/lib/pgsql/data
+            - name: tmp
+              mountPath: /tmp
+            - name: pgsql-run
+              mountPath: /run/postgresql
           securityContext:
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 1000850000
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: pgsql-home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: pgsql-run
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -280,7 +302,7 @@ spec:
             limits:
               cpu: "2"
               memory: "1Gi"
-          securityContext:
+          securityContext:            
             runAsNonRoot: true
             runAsUser: 1000850000
             allowPrivilegeEscalation: false
@@ -324,6 +346,22 @@ spec:
       labels:
         app.kubernetes.io/name: apicurio-registry-ui
     spec:
+      initContainers:
+        # /opt/app-root contient la SPA bundlée + des scripts d'init qui
+        # écrivent au boot (config.js, index.html avec base href, passwd).
+        # Avec readOnlyRootFilesystem: true, on doit monter un emptyDir
+        # writable dessus — mais ça masquerait les fichiers de l'image.
+        # On seed donc l'emptyDir depuis l'image via cet initContainer.
+        - name: seed-app-root
+          image: quay.io/apicurio/apicurio-registry-ui:3.2.5
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - cp -a /opt/app-root/. /seed/
+          volumeMounts:
+            - name: app-root
+              mountPath: /seed
       containers:
         - name: ui
           image: quay.io/apicurio/apicurio-registry-ui:3.2.5
@@ -356,12 +394,41 @@ spec:
             limits:
               cpu: "500m"
               memory: "256Mi"
+          volumeMounts:
+            # Seedé par seed-app-root. Contient src/ (SPA), etc/ (passwd
+            # template + generate_container_user), et la conf nginx-sed.
+            - name: app-root
+              mountPath: /opt/app-root
+            # nginx pid file (cf. /etc/nginx/nginx.conf : pid /tmp/nginx.pid)
+            - name: tmp
+              mountPath: /tmp
+            # Logs nginx (error.log + access.log) — souvent redirigés vers
+            # stdout/stderr en image, mais le binaire nginx vérifie le path
+            - name: nginx-log
+              mountPath: /var/log/nginx
+            # nginx scratch dirs
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: var-run
+              mountPath: /var/run
           securityContext:
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 1000850000
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: app-root
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-log
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: var-run
+          emptyDir: {}
 ---
 # -----------------------------------------------------------------------------
 # Ingress : un seul host expose UI et API
