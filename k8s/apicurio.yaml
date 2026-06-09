@@ -358,10 +358,30 @@ spec:
           command:
             - sh
             - -c
-            - cp -a /opt/app-root/. /seed/
+            - |
+              # `cp -r` (et pas -a) : -a essaie de préserver les timestamps
+              # sur /seed/. (le mountpoint emptyDir owné root) → EPERM avec
+              # readOnlyRootFilesystem / non-root.
+              cp -r /opt/app-root/. /seed/
+              # nginx fait `mkdir(/var/lib/nginx/tmp/client_body)` SANS -p,
+              # donc on doit pré-créer le parent /var/lib/nginx/tmp.
+              mkdir -p /nginx-lib/tmp
+              echo "Seed complete."
           volumeMounts:
             - name: app-root
               mountPath: /seed
+            - name: nginx-lib
+              mountPath: /nginx-lib
+          securityContext:
+            # /!\ MÊME UID que le main container. Sans ce override, OpenShift
+            # peut attribuer un UID arbitraire à ce initContainer (différent
+            # du main), et les fichiers copiés deviennent inaccessibles en
+            # écriture pour le main (EACCES sur config.js, index.html).
+            runAsNonRoot: true
+            runAsUser: 1000850000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
       containers:
         - name: ui
           image: quay.io/apicurio/apicurio-registry-ui:3.2.5
@@ -409,6 +429,9 @@ spec:
             # nginx scratch dirs
             - name: nginx-cache
               mountPath: /var/cache/nginx
+            # nginx body / proxy temp paths (mkdir au boot)
+            - name: nginx-lib
+              mountPath: /var/lib/nginx
             - name: var-run
               mountPath: /var/run
           securityContext:
@@ -426,6 +449,8 @@ spec:
         - name: nginx-log
           emptyDir: {}
         - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-lib
           emptyDir: {}
         - name: var-run
           emptyDir: {}
