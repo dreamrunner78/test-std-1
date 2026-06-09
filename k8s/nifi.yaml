@@ -130,17 +130,53 @@ spec:
         - name: init-conf
           image: apache/nifi:2.8.0
           imagePullPolicy: IfNotPresent
+          env:
+            # Doit correspondre à NIFI_ROUTE_HOSTNAME du main container.
+            # Utilisé par le script pour régénérer le keystore au besoin.
+            - name: NIFI_ROUTE_HOSTNAME
+              value: "nifi-apicurio.apps.rhodcpfco.rho-dcp.fr"
           command:
             - sh
             - -c
             - |
+              # 1) Seed initial des conf depuis l'image si la PVC est vide
               if [ ! -f /persist/bootstrap.conf ]; then
                 echo "Seeding empty conf PVC from image defaults..."
                 cp -a /opt/nifi/nifi-current/conf/. /persist/
-                echo "Seed done. Files now in PVC:"
-                ls -la /persist/
+                echo "Seed done."
               else
                 echo "conf PVC already seeded, skipping."
+              fi
+              # 2) Régénération idempotente du keystore self-signed avec tous
+              #    les SANs nécessaires (notamment le hostname de la Route
+              #    OpenShift). Le keystore généré par défaut par NiFi 2.x ne
+              #    contient que `localhost`, `nifi-0`, `nifi.local` → la Route
+              #    OpenShift en TLS passthrough renvoie "HTTP 400 Invalid SNI".
+              #    Les `nifi.web.https.sni.{required,host.check}=false` qu'on
+              #    voit dans des blogs sont OBSOLÈTES en 2.8 (retirées) — le
+              #    seul fix qui marche est d'avoir les bons SANs dans le cert.
+              REQUIRED_SAN="${NIFI_ROUTE_HOSTNAME:-nifi-apicurio.apps.rhodcpfco.rho-dcp.fr}"
+              KEYSTORE=/persist/keystore.p12
+              if [ -f "$KEYSTORE" ]; then
+                # Récupère le password du nifi.properties (généré au premier
+                # boot par l'image) pour ouvrir/manipuler le keystore
+                PASS=$(grep '^nifi.security.keystorePasswd=' /persist/nifi.properties | cut -d= -f2)
+                if keytool -list -v -keystore "$KEYSTORE" -storetype PKCS12 \
+                       -storepass "$PASS" 2>/dev/null | grep -q "DNSName: $REQUIRED_SAN"; then
+                  echo "Keystore already contains required SAN [$REQUIRED_SAN], skipping."
+                else
+                  echo "Regenerating keystore with full SAN list..."
+                  rm -f "$KEYSTORE"
+                  keytool -genkeypair -alias nifi-key \
+                    -keyalg RSA -keysize 2048 -validity 825 \
+                    -keystore "$KEYSTORE" -storetype PKCS12 \
+                    -storepass "$PASS" -keypass "$PASS" \
+                    -dname 'CN=nifi-0, OU=NiFi, O=Internal, C=FR' \
+                    -ext "SAN=dns:localhost,dns:nifi-0,dns:nifi.local,dns:nifi,dns:nifi.apicurio.svc,dns:nifi.apicurio.svc.cluster.local,dns:$REQUIRED_SAN,ip:127.0.0.1" \
+                    -ext 'KeyUsage=digitalSignature,keyEncipherment' \
+                    -ext 'ExtendedKeyUsage=serverAuth,clientAuth'
+                  echo "Keystore regenerated with SANs."
+                fi
               fi
           volumeMounts:
             - name: conf
@@ -164,10 +200,15 @@ spec:
             # Forcer 0.0.0.0 pour écouter sur toutes les interfaces.
             - name: NIFI_WEB_HTTPS_HOST
               value: "0.0.0.0"
+            # Hostname externe (Route/Ingress) à inclure dans le cert auto-signé
+            # → lu par l'initContainer `init-conf` pour régénérer le keystore
+            # avec ce SAN. À adapter si tu changes de cluster/route.
+            - name: NIFI_ROUTE_HOSTNAME
+              value: "nifi-apicurio.apps.rhodcpfco.rho-dcp.fr"
             # Renseigner ici l'hôte externe utilisé pour accéder à NiFi
             # Sinon NiFi renvoie 400 "An invalid request was attempted"
             - name: NIFI_WEB_PROXY_HOST
-              value: "nifi.local:8443,localhost:8443"
+              value: "nifi.local:8443,localhost:8443,nifi-apicurio.apps.rhodcpfco.rho-dcp.fr:443"
             - name: NIFI_JVM_HEAP_INIT
               value: "2g"
             - name: NIFI_JVM_HEAP_MAX

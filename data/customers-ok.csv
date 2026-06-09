@@ -1,0 +1,4 @@
+customer_id,email,age,country,subscribed_at
+CUST-0001,alice@example.com,34,FR,1717590000000
+CUST-0002,bob@example.com,29,US,1717590060000
+CUST-0003,carla@example.com,42,DE,1717590120000

@@ -134,7 +134,13 @@ L'ID renvoyé (par exemple `1`) est ce que NiFi écrira dans le préfixe Conflue
 
 ## Étape 3 — Configurer les controller services NiFi
 
-Connectez-vous à l'UI NiFi (`https://localhost:8443/nifi/`, ignorer le warning TLS auto-signé, user `admin` / mot de passe défini dans le Secret). Allez dans **Process Group root → ⚙️ Configure → Controller Services → +**.
+Connectez-vous à l'UI NiFi (`https://localhost:8443/nifi/`, ignorer le warning TLS auto-signé, user `admin` / mot de passe défini dans le Secret).
+
+> **⚠️ Où créer les Controller Services** : **clic droit sur le canvas vide
+> → Configure → onglet Controller Services → +**. PAS via le menu hamburger
+> "Controller Settings → Management Controller Services" — ce dernier est
+> réservé aux Reporting Tasks et les processeurs (`ConsumeKafka`,
+> `PublishKafka`, etc.) ne voient pas ces services.
 
 > Note : tous les noms entre crochets `[...]` ci-dessous sont des **noms libres** à donner au controller service pour le retrouver dans les processeurs.
 

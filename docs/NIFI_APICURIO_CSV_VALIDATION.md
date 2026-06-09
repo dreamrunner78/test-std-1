@@ -166,7 +166,22 @@ Causes d'échec :
 Connecte-toi à l'UI NiFi (`https://localhost:8443/nifi/`, accepter le warning
 TLS auto-signé, identifiants du Secret `nifi-credentials`).
 
-Process Group root → ⚙️ → **Controller Services** → +.
+> **⚠️ Important — où créer les Controller Services**
+>
+> NiFi a deux registres distincts :
+>
+> - **Hamburger menu (≡) → Controller Settings → Management Controller Services**
+>   → portée GLOBALE, visible uniquement par les Reporting Tasks.
+>   **Les processeurs (ValidateRecord, ConsumeKafka, etc.) ne voient PAS
+>   ces services.**
+>
+> - **Clic droit sur le canvas vide du Process Group → Configure → onglet
+>   "Controller Services"** → portée PROCESS GROUP courant.
+>   **C'est ici qu'il faut créer les services pour qu'ils soient sélectionnables
+>   dans les processeurs.**
+>
+> Crée donc tous les services ci-dessous via le second chemin (clic droit
+> sur le canvas vide → Configure → Controller Services → +).
 
 ### 3.1 `StandardWebClientServiceProvider` — `[web-client]`
 
