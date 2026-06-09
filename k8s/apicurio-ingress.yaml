@@ -1,0 +1,80 @@
+# =============================================================================
+# Apicurio Registry — Ingress(es)
+# =============================================================================
+# Variante alternative aux Routes OpenShift (déjà incluses dans apicurio.yaml).
+# À appliquer SI tu déploies sur Kubernetes vanilla (pas OpenShift), ou si
+# tu veux remplacer les Routes par des Ingress.
+#
+# Architecture identique aux Routes :
+#   /          -> apicurio-registry-ui   (SPA React)
+#   /apis      -> apicurio-registry      (REST v3 + ccompat v7 + cncf + system)
+#
+# Same-origin → AUCUN preflight CORS dans le browser.
+#
+# /!\ Sur OpenShift : ce manifeste fonctionne quand même — l'admission
+#     controller convertit automatiquement l'Ingress en Route à l'arrivée.
+#     Tu peux donc l'utiliser SOIT à la place des Routes (delete + apply),
+#     SOIT en parallèle si tu veux deux chemins de sortie.
+#
+# /!\ Adapter `host:` et la section `tls:` à ton cluster avant d'appliquer.
+#
+# Appliquer :
+#   kubectl apply -f k8s/apicurio-ingress.yaml
+#
+# Tester :
+#   curl -k https://apicurio.apps.rhodcpfco.rho-dcp.fr/apis/registry/v3/system/info
+#   open  https://apicurio.apps.rhodcpfco.rho-dcp.fr/
+# =============================================================================
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: apicurio
+  namespace: apicurio
+  labels:
+    app.kubernetes.io/part-of: apicurio-registry
+  annotations:
+    # ----- Annotations NGINX Ingress Controller (Kubernetes vanilla) -----
+    # nginx.ingress.kubernetes.io/proxy-body-size:      "10m"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout:   "60"
+    # nginx.ingress.kubernetes.io/ssl-redirect:         "true"
+    #
+    # ----- Annotations OpenShift Route auto-générée depuis Ingress -----
+    route.openshift.io/termination: edge
+spec:
+  # Sur K8s vanilla : décommenter et renseigner la classe (nginx, traefik, ...)
+  # ingressClassName: nginx
+  #
+  # Sur OpenShift : laisser absent — l'IngressOperator gère le mapping vers Route
+  rules:
+    - host: apicurio.apps.rhodcpfco.rho-dcp.fr
+      http:
+        paths:
+          # ----- API REST + ccompat + cncf + system -----
+          # /!\ Important : /apis AVANT / pour que le path-match soit correct.
+          # Kubernetes evalue les paths dans l'ordre, le plus spécifique gagne.
+          - path: /apis
+            pathType: Prefix
+            backend:
+              service:
+                name: apicurio-registry
+                port:
+                  number: 8080
+          # ----- UI (SPA React) -----
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: apicurio-registry-ui
+                port:
+                  number: 8080
+  # TLS — combiné avec l'annotation `route.openshift.io/termination: edge`,
+  # OpenShift convertit en Route edge utilisant le cert wildcard du router
+  # *.apps.<cluster> (browser-trusted dans le contexte d'entreprise).
+  #
+  # Sur K8s vanilla : décommenter `secretName:` et créer le Secret via
+  # cert-manager (Certificate CRD) ou kubectl create secret tls.
+  tls:
+    - hosts:
+        - apicurio.apps.rhodcpfco.rho-dcp.fr
+      # secretName: apicurio-tls
